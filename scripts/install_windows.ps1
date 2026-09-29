@@ -1206,6 +1206,50 @@ function Sync-ClaudeExeAsarIntegrity {
     Write-Host "  updated Claude.exe app.asar integrity: $currentHash -> $headerHash" -ForegroundColor Green
 }
 
+function Get-FrontendJsFilesContaining {
+    param(
+        [string]$AssetsDir,
+        [string[]]$Needles
+    )
+
+    $jsFiles = @(Get-ChildItem (Join-Path $AssetsDir "*.js") -File -ErrorAction SilentlyContinue)
+    if ($jsFiles.Count -eq 0) {
+        throw "未找到前端 JS bundle: $AssetsDir"
+    }
+
+    $ascii = [System.Text.Encoding]::ASCII
+    $patterns = @($Needles | Where-Object { $_ })
+    $matched = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    foreach ($file in $jsFiles) {
+        $stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $buffer = [byte[]]::new(1024 * 1024)
+            $carry = ""
+            $keep = 4096
+            while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $chunk = $carry + $ascii.GetString($buffer, 0, $read)
+                foreach ($needle in $patterns) {
+                    if ($chunk.Contains($needle)) {
+                        $matched.Add($file)
+                        $read = -1
+                        break
+                    }
+                }
+                if ($read -lt 0) {
+                    break
+                }
+                $carry = if ($chunk.Length -gt $keep) { $chunk.Substring($chunk.Length - $keep) } else { $chunk }
+            }
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+
+    Write-Host "  located $($matched.Count)/$($jsFiles.Count) frontend JS files containing target text" -ForegroundColor DarkGray
+    return @($matched)
+}
+
 function Register-Language {
     param(
         [string]$ResourcesPath,
@@ -1213,7 +1257,7 @@ function Register-Language {
     )
 
     $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "*.js") -ErrorAction SilentlyContinue)
+    $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir @('"en-US","de-DE","fr-FR","ko-KR","ja-JP"'))
     if ($jsFiles.Count -eq 0) {
         throw "未找到前端 JS bundle: $assetsDir"
     }
@@ -1252,12 +1296,13 @@ function Patch-LanguageDisplayNames {
     param([string]$ResourcesPath)
 
     $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "*.js") -ErrorAction SilentlyContinue)
+    $marker = "__claudeZhLabelPatch"
+    $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir @("Intl.DisplayNames", $marker))
     if ($jsFiles.Count -eq 0) {
-        throw "未找到前端 JS bundle: $assetsDir"
+        Write-Host "  no Intl.DisplayNames bundle found; skipping language display names" -ForegroundColor DarkYellow
+        return
     }
 
-    $marker = "__claudeZhLabelPatch"
     $patch = ';(()=>{const e=Intl.DisplayNames&&Intl.DisplayNames.prototype;if(!e||e.__claudeZhLabelPatch)return;const n=e.of;e.of=function(e){const t=String(e);return t==="zh-CN"?"简体中文":t==="zh-HK"?"繁体中文（中国香港）":t==="zh-TW"?"繁体中文（中国台湾）":n.call(this,e)},Object.defineProperty(e,"__claudeZhLabelPatch",{value:!0})})();'
     $patchedFiles = 0
     foreach ($file in $jsFiles) {
@@ -2262,12 +2307,24 @@ function Patch-HardcodedFrontendStrings {
     )
 
     $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "*.js") -ErrorAction SilentlyContinue)
+    $replacements = @(Get-FrontendHardcodedReplacements $Language)
+    $needles = New-Object System.Collections.Generic.List[string]
+    foreach ($pair in $replacements) {
+        $source = [string]$pair[0]
+        if ((Test-StructuralJsReplacement $source) -or $source.Contains("`n") -or $source.Length -lt 8) {
+            continue
+        }
+        $needle = ($source -replace '[^ -~]', '').Trim()
+        if ($needle.Length -ge 8) {
+            $needles.Add($needle.Substring(0, [Math]::Min(48, $needle.Length)))
+        }
+    }
+    $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir @($needles | Select-Object -Unique))
     if ($jsFiles.Count -eq 0) {
-        throw "未找到前端 JS bundle: $assetsDir"
+        Write-Host "  no frontend JS contains hardcoded UI text; skipping" -ForegroundColor DarkYellow
+        return
     }
 
-    $replacements = @(Get-FrontendHardcodedReplacements $Language)
 
     # 预处理：过滤结构性跳过规则，plain 规则一次性编译 Regex，
     # 避免 (文件 × 规则) 循环里反复拼 pattern、调函数、分配哈希表。
