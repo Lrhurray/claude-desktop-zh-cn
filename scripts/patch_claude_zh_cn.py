@@ -179,17 +179,13 @@ def patch_language_whitelist(app: Path, lang_code: str) -> Path:
 
     for path in candidates:
         text = path.read_text(encoding="utf-8")
-        if replacement in text:
-            print(f"Language whitelist already contains {lang_code}: {path.name}")
-            return path
         if LANG_LIST_RE.search(text):
-            patched = LANG_LIST_RE.sub(
-                replacement,
-                text,
-                count=1,
-            )
+            # Claude 2.9939.2 起同一 bundle 内有多份语言白名单（导航语言解析与
+            # 语言可用性校验各一份），必须全部补上，漏一份该路径就会把 zh 回退
+            # 成 en-US。正则会吞掉已存在的 zh 项，重复运行是幂等的。
+            patched, occurrences = LANG_LIST_RE.subn(replacement, text)
             path.write_text(patched, encoding="utf-8")
-            print(f"Patched language whitelist: {path.name}")
+            print(f"Patched language whitelist: {path.name} ({occurrences} occurrence(s))")
             return path
 
     raise SystemExit("Could not patch language whitelist. Claude's bundle format may have changed.")
@@ -242,7 +238,12 @@ def is_structural_js_literal_context(text: str, literal_start: int) -> bool:
     return STRUCTURAL_JS_LITERAL_CONTEXT_RE.search(prefix) is not None
 
 
-def replace_frontend_hardcoded_text(text: str, source: str, target: str) -> tuple[str, int]:
+def replace_frontend_hardcoded_text(
+    text: str,
+    source: str,
+    target: str,
+    pattern: re.Pattern[str] | None = None,
+) -> tuple[str, int]:
     if source in STRUCTURAL_JS_STRING_REPLACEMENTS or source in STRUCTURAL_JS_LITERAL_REPLACEMENTS:
         return text, 0
 
@@ -252,7 +253,8 @@ def replace_frontend_hardcoded_text(text: str, source: str, target: str) -> tupl
             text = text.replace(source, target)
         return text, count
 
-    pattern = re.compile(r'(?P<quote>["\'`])' + re.escape(source) + r"(?P=quote)")
+    if pattern is None:
+        pattern = re.compile(r'(?P<quote>["\'`])' + re.escape(source) + r"(?P=quote)")
     replacement_count = 0
 
     def replace_match(match: re.Match[str]) -> str:
@@ -266,6 +268,47 @@ def replace_frontend_hardcoded_text(text: str, source: str, target: str) -> tupl
     return pattern.sub(replace_match, text), replacement_count
 
 
+_WORKER_RULES: list[tuple[str, str, "re.Pattern[str] | None"]] = []
+
+
+def _prepare_hardcoded_rules(
+    replacement_items: list[tuple[str, str]],
+) -> list[tuple[str, str, "re.Pattern[str] | None"]]:
+    return [
+        (
+            source,
+            target,
+            re.compile(r'(?P<quote>["\'`])' + re.escape(source) + r"(?P=quote)")
+            if is_plain_ui_text_replacement(source)
+            else None,
+        )
+        for source, target in replacement_items
+    ]
+
+
+def _init_patch_worker(replacement_items: list[tuple[str, str]]) -> None:
+    global _WORKER_RULES
+    _WORKER_RULES = _prepare_hardcoded_rules(replacement_items)
+
+
+def _patch_frontend_file(path_str: str) -> tuple[bool, int]:
+    path = Path(path_str)
+    text = path.read_text(encoding="utf-8")
+    # 任何替换（引号包裹或直接替换）都要求原文至少出现一次，粗筛可跳过绝大多数无命中文件。
+    if not any(source in text for source, _, _ in _WORKER_RULES):
+        return False, 0
+    patched = text
+    count = 0
+    for source, target, pattern in _WORKER_RULES:
+        patched, occurrences = replace_frontend_hardcoded_text(patched, source, target, pattern)
+        if occurrences:
+            count += occurrences
+    if patched != text:
+        path.write_text(patched, encoding="utf-8")
+        return True, count
+    return False, 0
+
+
 def patch_hardcoded_frontend_strings(app: Path, lang_code: str) -> None:
     start = time.perf_counter()
     assets_dir = app / FRONTEND_ASSETS_REL
@@ -275,31 +318,63 @@ def patch_hardcoded_frontend_strings(app: Path, lang_code: str) -> None:
         reverse=True,
     )
     js_files = sorted(assets_dir.glob("*.js"))
-    patched_files = 0
-    patched_strings = 0
+    total_files = len(js_files)
 
     log(
         "Scanning frontend JS for hardcoded strings: "
-        f"{len(js_files)} files, {len(replacement_items)} replacement rules"
+        f"{total_files} files, {len(replacement_items)} replacement rules"
     )
-    for index, path in enumerate(js_files, start=1):
-        text = path.read_text(encoding="utf-8")
-        patched = text
-        count = 0
-        for source, target in replacement_items:
-            patched, occurrences = replace_frontend_hardcoded_text(patched, source, target)
-            if occurrences:
-                count += occurrences
-        if patched != text:
-            path.write_text(patched, encoding="utf-8")
-            patched_files += 1
-            patched_strings += count
-        if index % 50 == 0 or index == len(js_files):
+
+    patched_files = 0
+    patched_strings = 0
+
+    def report(index: int) -> None:
+        if index % 50 == 0 or index == total_files:
             log(
                 "  scanned "
-                f"{index}/{len(js_files)} JS files, "
+                f"{index}/{total_files} JS files, "
                 f"{patched_strings} replacements so far ({elapsed_since(start)})"
             )
+
+    pool = None
+    results = None
+    workers = min(os.cpu_count() or 1, 12)
+    if workers > 1 and total_files > 64:
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+
+            # 文件互相独立，可并行；大文件先派发以均衡各 worker 负载。
+            # 子进程启动/任务提交可能因受限环境失败，整体回退单进程；
+            # 而迭代结果阶段的工作异常仍会照常抛出终止安装。
+            by_size = sorted(js_files, key=lambda p: p.stat().st_size, reverse=True)
+            pool = ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_patch_worker,
+                initargs=(replacement_items,),
+            )
+            results = pool.map(_patch_frontend_file, (str(p) for p in by_size), chunksize=1)
+        except Exception as exc:
+            log(f"Parallel scan unavailable ({type(exc).__name__}: {exc}); falling back to single process")
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+            pool = None
+            results = None
+
+    if pool is not None and results is not None:
+        try:
+            for index, (file_patched, count) in enumerate(results, start=1):
+                patched_files += int(file_patched)
+                patched_strings += count
+                report(index)
+        finally:
+            pool.shutdown()
+    else:
+        _init_patch_worker(replacement_items)
+        for index, path in enumerate(js_files, start=1):
+            file_patched, count = _patch_frontend_file(str(path))
+            patched_files += int(file_patched)
+            patched_strings += count
+            report(index)
 
     log(
         "Patched hardcoded frontend strings: "
@@ -1982,6 +2057,19 @@ def install_statsig_locale(app: Path, lang_code: str) -> None:
     print(f"Installed statsig {lang_code} resource")
 
 
+def install_dynamic_locale(app: Path, lang_code: str) -> None:
+    dynamic_dir = app / FRONTEND_I18N_REL / "dynamic"
+    source = dynamic_dir / "en-US.json"
+    if not source.exists():
+        # Claude < 2.9939.2 没有 dynamic 目录，无需处理。
+        return
+    # 2.9939.2 起 dynamic catalog 与主语言包一起强制加载（fetch 非 2xx 直接抛错），
+    # 缺失会让整个 zh 语言包加载失败并回退英文。其 key 是内容哈希，随包词表暂无
+    # 对应翻译，先按官方 en-US 原文兜底，保证加载不失败。
+    shutil.copy2(source, dynamic_dir / f"{lang_code}.json")
+    print(f"Installed frontend dynamic {lang_code} resource")
+
+
 def app_bundle_identifier(app: Path) -> str | None:
     """Return CFBundleIdentifier of *app*, or None when it cannot be read."""
     info_plist = app / "Contents/Info.plist"
@@ -2990,6 +3078,15 @@ def verify(app: Path, lang_code: str, *, expect_online_patch: bool = True) -> No
     chinese = sum(1 for v in values if re.search(r"[\u4e00-\u9fff]", v))
     print(f"Verified frontend {lang_code} JSON: {chinese}/{len(values)} strings contain Chinese")
 
+    dynamic_dir = app / FRONTEND_I18N_REL / "dynamic"
+    if (dynamic_dir / "en-US.json").exists():
+        if not (dynamic_dir / f"{lang_code}.json").exists():
+            raise SystemExit(
+                f"Missing required dynamic i18n catalog: {dynamic_dir / f'{lang_code}.json'}; "
+                "Claude >= 2.9939.2 fails to load the language without it."
+            )
+        print(f"Verified frontend dynamic {lang_code} catalog exists")
+
     verify_electron_asar_integrity(app)
     if expect_online_patch:
         verify_online_locale_patch(app, lang_code)
@@ -3161,6 +3258,7 @@ def main() -> int:
     merge_frontend_locale(patched_app, lang_code)
     install_desktop_locale(patched_app, lang_code)
     install_statsig_locale(patched_app, lang_code)
+    install_dynamic_locale(patched_app, lang_code)
     resign_app(patched_app)
     clear_quarantine(patched_app)
     if args.dry_run:

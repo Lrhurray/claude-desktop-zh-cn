@@ -668,6 +668,7 @@ function Enable-WriteAccess {
         (Join-Path $ResourcesPath "ion-dist"),
         (Join-Path $ResourcesPath "ion-dist\i18n"),
         (Join-Path $ResourcesPath "ion-dist\i18n\statsig"),
+        (Join-Path $ResourcesPath "ion-dist\i18n\dynamic"),
         (Join-Path $ResourcesPath "ion-dist\assets"),
         (Join-Path $ResourcesPath "ion-dist\assets\v1")
     )
@@ -697,6 +698,16 @@ function Install-LanguageFiles {
 
     Copy-Item $Pack["Statsig"] (Join-Path $statsigDir "$Lang.json") -Force
     Write-Host "  installed ion-dist/i18n/statsig/$Lang.json" -ForegroundColor Green
+
+    # Claude 2.9939.2 起前端强制加载 dynamic catalog，缺失会让整个语言包加载失败并
+    # 回退英文。其 key 为内容哈希、随包词表暂无对应翻译，按官方 en-US 原文兜底。
+    $dynamicDir = Join-Path $i18nDir "dynamic"
+    $dynamicEn = Join-Path $dynamicDir "en-US.json"
+    if (Test-Path $dynamicEn) {
+        New-Item -ItemType Directory -Path $dynamicDir -Force | Out-Null
+        Copy-Item $dynamicEn (Join-Path $dynamicDir "$Lang.json") -Force
+        Write-Host "  installed ion-dist/i18n/dynamic/$Lang.json" -ForegroundColor Green
+    }
 }
 
 function Align-4 {
@@ -1213,19 +1224,23 @@ function Register-Language {
     $already = 0
     foreach ($file in $jsFiles) {
         $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
-        if ($text.Contains($replacement)) {
+        if (-not $regex.IsMatch($text)) {
+            continue
+        }
+
+        # Claude 2.9939.2 起同一 bundle 内有多份语言白名单（导航语言解析与语言可用性
+        # 校验各一份），必须全部补上；正则会吞掉已存在的 zh 项，整体替换是幂等的。
+        $updated = $regex.Replace($text, $replacement)
+        if ($updated -eq $text) {
             Write-Host "  $Lang already registered: $($file.Name)" -ForegroundColor Green
             $already += 1
             continue
         }
 
-        if ($regex.IsMatch($text)) {
-            $updated = $regex.Replace($text, $replacement, 1)
-            Backup-ModifiedFile $ResourcesPath $file.FullName
-            [System.IO.File]::WriteAllText($file.FullName, $updated, $Utf8NoBom)
-            Write-Host "  patched language whitelist for ${Lang}: $($file.Name)" -ForegroundColor Green
-            $changed += 1
-        }
+        Backup-ModifiedFile $ResourcesPath $file.FullName
+        [System.IO.File]::WriteAllText($file.FullName, $updated, $Utf8NoBom)
+        Write-Host "  patched language whitelist for ${Lang}: $($file.Name)" -ForegroundColor Green
+        $changed += 1
     }
 
     if (($changed + $already) -eq 0) {
@@ -2140,6 +2155,106 @@ function Patch-OnlineDomTranslation {
     throw "Could not find online claude.ai DOM translation injection point. Claude's bundle format may have changed."
 }
 
+$script:FrontendPatcherCSharp = @'
+using System;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace ClaudeZhPatch
+{
+    public static class FrontendPatcher
+    {
+        static readonly Regex StructuralContextRe = new Regex(
+            "(?<![A-Za-z0-9_$-])(?:as|component|displayName|glyph|icon|iconName|leadingIcon|name|role|trailingIcon|type)\\s*[:=]\\s*$");
+
+        static bool IsStructuralJsLiteralContext(string text, int literalStart)
+        {
+            int prefixStart = Math.Max(0, literalStart - 96);
+            string prefix = text.Substring(prefixStart, literalStart - prefixStart);
+            return StructuralContextRe.IsMatch(prefix);
+        }
+
+        static int CountOrdinal(string text, string source)
+        {
+            int occurrences = 0;
+            int index = text.IndexOf(source, StringComparison.Ordinal);
+            while (index >= 0)
+            {
+                occurrences++;
+                index = text.IndexOf(source, index + source.Length, StringComparison.Ordinal);
+            }
+            return occurrences;
+        }
+
+        // rules 行结构: [Regex(plain 规则, 直接替换规则为 null), source, target]，顺序与词表一致。
+        // 纯计算：不读盘之外不做任何副作用，变更后的内容写入 outputContents[i]，由调用方备份并写盘。
+        // 返回每个文件的替换计数（未变更为 0）。
+        public static int[] PatchFiles(string[] filePaths, object[][] rules, int maxWorkers, string[] outputContents)
+        {
+            int total = filePaths.Length;
+            int scanned = 0;
+            int[] counts = new int[total];
+            Parallel.For(0, total, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, maxWorkers) }, delegate(int i)
+            {
+                string filePath = filePaths[i];
+                string text = File.ReadAllText(filePath, Encoding.UTF8);
+                string patched = text;
+                int count = 0;
+                for (int r = 0; r < rules.Length; r++)
+                {
+                    object[] rule = rules[r];
+                    string source = (string)rule[1];
+                    if (!patched.Contains(source))
+                    {
+                        continue;
+                    }
+                    Regex regex = (Regex)rule[0];
+                    string target = (string)rule[2];
+                    if (regex != null)
+                    {
+                        string current = patched;
+                        int localCount = 0;
+                        patched = regex.Replace(current, delegate(Match m)
+                        {
+                            if (IsStructuralJsLiteralContext(current, m.Index))
+                            {
+                                return m.Value;
+                            }
+                            localCount++;
+                            return m.Groups["quote"].Value + target + m.Groups["quote"].Value;
+                        });
+                        count += localCount;
+                    }
+                    else
+                    {
+                        int occurrences = CountOrdinal(patched, source);
+                        if (occurrences > 0)
+                        {
+                            patched = patched.Replace(source, target);
+                            count += occurrences;
+                        }
+                    }
+                }
+                if (count > 0 && !string.Equals(patched, text, StringComparison.OrdinalIgnoreCase))
+                {
+                    outputContents[i] = patched;
+                    counts[i] = count;
+                }
+                int done = Interlocked.Increment(ref scanned);
+                if (done % 250 == 0 || done == total)
+                {
+                    Console.WriteLine("  scanned " + done + "/" + total + " JS files");
+                }
+            });
+            return counts;
+        }
+    }
+}
+'@
+
 function Patch-HardcodedFrontendStrings {
     param(
         [string]$ResourcesPath,
@@ -2153,35 +2268,80 @@ function Patch-HardcodedFrontendStrings {
     }
 
     $replacements = @(Get-FrontendHardcodedReplacements $Language)
+
+    # 预处理：过滤结构性跳过规则，plain 规则一次性编译 Regex，
+    # 避免 (文件 × 规则) 循环里反复拼 pattern、调函数、分配哈希表。
+    $prepared = New-Object 'System.Collections.Generic.List[object[]]'
+    foreach ($pair in $replacements) {
+        $source = [string]$pair[0]
+        $target = [string]$pair[1]
+        if (Test-StructuralJsReplacement $source) {
+            continue
+        }
+        if (Test-PlainUiTextReplacement $source) {
+            $pattern = '(?<quote>["''`])' + [System.Text.RegularExpressions.Regex]::Escape($source) + '\k<quote>'
+            $prepared.Add([object[]]@(
+                [System.Text.RegularExpressions.Regex]::new($pattern),
+                $source,
+                $target
+            ))
+        } else {
+            $prepared.Add([object[]]@($null, $source, $target))
+        }
+    }
+
+    Write-Host "  scanning frontend JS for hardcoded strings: $($jsFiles.Count) files, $($prepared.Count) replacement rules" -ForegroundColor DarkGray
     $patchedFiles = 0
     $patchedStrings = 0
-    $fileIndex = 0
-    foreach ($file in $jsFiles) {
-        $fileIndex += 1
-        $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
-        $patched = $text
-        $count = 0
-        foreach ($pair in $replacements) {
-            $source = $pair[0]
-            $target = $pair[1]
-            if (-not $patched.Contains($source)) {
-                continue
-            }
-            $result = Replace-FrontendHardcodedText $patched $source $target
-            if ($result["Count"] -gt 0) {
-                $patched = $result["Text"]
-                $count += $result["Count"]
+
+    $patcherReady = $false
+    try {
+        if (-not ("ClaudeZhPatch.FrontendPatcher" -as [type])) {
+            Add-Type -TypeDefinition $script:FrontendPatcherCSharp -ErrorAction Stop
+        }
+        $patcherReady = $true
+    } catch {
+        Write-Host "  native scan helper unavailable ($($_.Exception.Message)); using single-threaded fallback" -ForegroundColor DarkYellow
+    }
+
+    if ($patcherReady) {
+        $filePaths = [string[]]@($jsFiles | ForEach-Object { $_.FullName })
+        $outputContents = [string[]]::new($filePaths.Count)
+        $workers = [Math]::Max(1, [Math]::Min([Environment]::ProcessorCount, 12))
+        $counts = [ClaudeZhPatch.FrontendPatcher]::PatchFiles($filePaths, $prepared.ToArray(), $workers, $outputContents)
+        for ($i = 0; $i -lt $filePaths.Count; $i++) {
+            if ($null -ne $outputContents[$i]) {
+                Backup-ModifiedFile $ResourcesPath $filePaths[$i]
+                [System.IO.File]::WriteAllText($filePaths[$i], $outputContents[$i], $Utf8NoBom)
+                $patchedFiles += 1
+                $patchedStrings += $counts[$i]
+                Write-Host "  patched: $([System.IO.Path]::GetFileName($filePaths[$i])) ($($counts[$i]) replacements)" -ForegroundColor DarkGray
             }
         }
-
-        if ($patched -ne $text) {
-            Backup-ModifiedFile $ResourcesPath $file.FullName
-            [System.IO.File]::WriteAllText($file.FullName, $patched, $Utf8NoBom)
-            $patchedFiles += 1
-            $patchedStrings += $count
-            Write-Host "  patched file $fileIndex/$($jsFiles.Count): $($file.Name) ($count replacements)" -ForegroundColor DarkGray
-        } else {
-            Write-Host "  skipping file $fileIndex/$($jsFiles.Count): $($file.Name) (no matches)" -ForegroundColor DarkGray
+    } else {
+        foreach ($file in $jsFiles) {
+            $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+            $patched = $text
+            $count = 0
+            foreach ($rule in $prepared) {
+                $source = [string]$rule[1]
+                $target = [string]$rule[2]
+                if (-not $patched.Contains($source)) {
+                    continue
+                }
+                $result = Replace-FrontendHardcodedText $patched $source $target
+                if ($result["Count"] -gt 0) {
+                    $patched = $result["Text"]
+                    $count += $result["Count"]
+                }
+            }
+            if ($patched -ne $text) {
+                Backup-ModifiedFile $ResourcesPath $file.FullName
+                [System.IO.File]::WriteAllText($file.FullName, $patched, $Utf8NoBom)
+                $patchedFiles += 1
+                $patchedStrings += $count
+                Write-Host "  patched file: $($file.Name) ($count replacements)" -ForegroundColor DarkGray
+            }
         }
     }
 
@@ -3783,12 +3943,15 @@ function Remove-LanguageFiles {
         (Join-Path $ResourcesPath "ion-dist\i18n\zh-CN.json"),
         (Join-Path $ResourcesPath "zh-CN.json"),
         (Join-Path $ResourcesPath "ion-dist\i18n\statsig\zh-CN.json"),
+        (Join-Path $ResourcesPath "ion-dist\i18n\dynamic\zh-CN.json"),
         (Join-Path $ResourcesPath "ion-dist\i18n\zh-TW.json"),
         (Join-Path $ResourcesPath "zh-TW.json"),
         (Join-Path $ResourcesPath "ion-dist\i18n\statsig\zh-TW.json"),
+        (Join-Path $ResourcesPath "ion-dist\i18n\dynamic\zh-TW.json"),
         (Join-Path $ResourcesPath "ion-dist\i18n\zh-HK.json"),
         (Join-Path $ResourcesPath "zh-HK.json"),
-        (Join-Path $ResourcesPath "ion-dist\i18n\statsig\zh-HK.json")
+        (Join-Path $ResourcesPath "ion-dist\i18n\statsig\zh-HK.json"),
+        (Join-Path $ResourcesPath "ion-dist\i18n\dynamic\zh-HK.json")
     )
 
     foreach ($target in $targets) {
