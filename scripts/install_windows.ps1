@@ -1331,6 +1331,11 @@ function Unregister-Language {
     param([string]$ResourcesPath)
 
     $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
+    if (-not (Test-Path (Join-Path $assetsDir "*.js"))) {
+        # Claude 已被卸载或资源目录不存在时安静跳过, 不阻断卸载流程
+        Write-Host "  [提示] 未找到前端 JS 目录($assetsDir)，跳过语言注销。" -ForegroundColor DarkYellow
+        return
+    }
     $needles = @(',"zh-CN"', ',"zh-TW"', ',"zh-HK"')
     $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir $needles)
     foreach ($file in $jsFiles) {
