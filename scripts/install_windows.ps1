@@ -1331,12 +1331,18 @@ function Unregister-Language {
     param([string]$ResourcesPath)
 
     $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "*.js") -ErrorAction SilentlyContinue)
+    if (-not (Test-Path (Join-Path $assetsDir "*.js"))) {
+        # Claude 已被卸载或资源目录不存在时安静跳过, 不阻断卸载流程
+        Write-Host "  [提示] 未找到前端 JS 目录($assetsDir)，跳过语言注销。" -ForegroundColor DarkYellow
+        return
+    }
+    $needles = @(',"zh-CN"', ',"zh-TW"', ',"zh-HK"')
+    $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir $needles)
     foreach ($file in $jsFiles) {
         $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
         $updated = $text
         $changed = $false
-        foreach ($lang in @(',"zh-CN"', ',"zh-TW"', ',"zh-HK"')) {
+        foreach ($lang in $needles) {
             if ($updated.Contains($lang)) {
                 $updated = $updated.Replace($lang, '')
                 $changed = $true
@@ -4151,10 +4157,25 @@ function Restart-Claude {
 
     Stop-ClaudeProcesses
 
+    # AppX(MSIX) 安装优先用包激活启动: 进程带包身份, 更新检查走 msix 路径
+    # (直接启动 exe 会被更新器误判为 Squirrel 解包安装而报 "Can not find Squirrel",
+    #  Cowork 客户端校验也只能靠签名回退)
+    try {
+        $app = Get-StartApps -ErrorAction Stop | Where-Object { $_.AppID -like "Claude_*!*" } | Select-Object -First 1
+        if ($app -and $app.AppID) {
+            Start-Process -FilePath "explorer.exe" -ArgumentList "shell:AppsFolder\$($app.AppID)"
+            Write-Host "  已通过 AppX 激活重启 Claude Desktop ($($app.AppID))" -ForegroundColor Green
+            return
+        }
+    } catch {
+        Write-Host "  [提示] AppX 激活不可用($($_.Exception.Message))，改用直接启动。" -ForegroundColor DarkYellow
+    }
+
     $exe = Get-ClaudeExePath $ClaudePath
     if ($exe) {
         Start-Process -FilePath "explorer.exe" -ArgumentList "`"$exe`""
         Write-Host "  restarted Claude Desktop" -ForegroundColor Green
+        Write-Host "  [提示] MSIX 安装建议从开始菜单启动 Claude，以获得完整功能(自动更新/Cowork)。" -ForegroundColor DarkYellow
         return
     }
 
