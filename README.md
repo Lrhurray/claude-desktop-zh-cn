@@ -27,9 +27,9 @@ macOS 双击 `install-mac.command`；Windows 双击 `install-windows.bat` 后按
 
 </details>
 
-**遇到问题请及时反馈，欢迎扫码加入 claude desktop 交流。**
+<p align="center"><strong>遇到问题请及时反馈，欢迎扫码加入 claude desktop 交流。</strong></p>
 
-<img src="docs/images/wechat-group.png" alt="claude desktop 交流群二维码" width="360">
+<p align="center"><img src="docs/images/wechat-group.png" alt="claude desktop 交流群二维码" width="360"></p>
 
 ## 界面截图
 
