@@ -16,7 +16,7 @@ macOS 双击 `install-mac.command`；Windows 双击 `install-windows.bat` 后按
 <td valign="middle"><strong>TokenMetro</strong> - 一家计费透明、自建号池的中转站。<br>
 相对官方价格：GPT 1 折，Gemini 一次 5分，DeepSeek0.1折。<br>
 明码标价，显示多少扣多少，不玩汇率魔术；自建号池，拒绝掺水。<br>
-限时福利 - 注册就送 5 ¥，一键上车：<a href="https://tokenmetro.com">https://tokenmetro.com</a></td>
+私信客服领取1r体验金，一键上车：<a href="https://tokenmetro.com">https://tokenmetro.com</a></td>
 </tr>
 <tr>
 <td width="250" align="center" valign="middle"><a href="https://www.oxoapi.com"><img src="docs/images/oxoapi.png" alt="OXOAPI" width="151"></a></td>
