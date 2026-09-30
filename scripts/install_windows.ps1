@@ -1206,6 +1206,54 @@ function Sync-ClaudeExeAsarIntegrity {
     Write-Host "  updated Claude.exe app.asar integrity: $currentHash -> $headerHash" -ForegroundColor Green
 }
 
+function Get-FrontendJsFilesContaining {
+    param(
+        [string]$AssetsDir,
+        [string[]]$Needles
+    )
+
+    $jsFiles = @(Get-ChildItem (Join-Path $AssetsDir "*.js") -File -ErrorAction SilentlyContinue)
+    if ($jsFiles.Count -eq 0) {
+        throw "未找到前端 JS bundle: $AssetsDir"
+    }
+
+    $patterns = @($Needles | Where-Object { $_ })
+    $keep = 0
+    foreach ($needle in $patterns) {
+        $keep = [Math]::Max($keep, $needle.Length - 1)
+    }
+    $matched = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    foreach ($file in $jsFiles) {
+        # StreamReader preserves UTF-8 characters split across reads. Keep enough
+        # overlap for the longest needle, rather than imposing a fixed limit.
+        $reader = [System.IO.StreamReader]::new($file.FullName, [System.Text.Encoding]::UTF8)
+        try {
+            $buffer = [char[]]::new(1024 * 1024)
+            $carry = ""
+            while (($read = $reader.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $chunk = $carry + [string]::new($buffer, 0, $read)
+                foreach ($needle in $patterns) {
+                    if ($chunk.Contains($needle)) {
+                        $matched.Add($file)
+                        $read = -1
+                        break
+                    }
+                }
+                if ($read -lt 0) {
+                    break
+                }
+                $carry = if ($chunk.Length -gt $keep) { $chunk.Substring($chunk.Length - $keep) } else { $chunk }
+            }
+        }
+        finally {
+            $reader.Dispose()
+        }
+    }
+
+    Write-Host "  located $($matched.Count)/$($jsFiles.Count) frontend JS files containing target text" -ForegroundColor DarkGray
+    return @($matched)
+}
+
 function Register-Language {
     param(
         [string]$ResourcesPath,
@@ -1213,7 +1261,7 @@ function Register-Language {
     )
 
     $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "*.js") -ErrorAction SilentlyContinue)
+    $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir @('"en-US","de-DE","fr-FR","ko-KR","ja-JP"'))
     if ($jsFiles.Count -eq 0) {
         throw "未找到前端 JS bundle: $assetsDir"
     }
@@ -1252,12 +1300,13 @@ function Patch-LanguageDisplayNames {
     param([string]$ResourcesPath)
 
     $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "*.js") -ErrorAction SilentlyContinue)
+    $marker = "__claudeZhLabelPatch"
+    $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir @("Intl.DisplayNames", $marker))
     if ($jsFiles.Count -eq 0) {
-        throw "未找到前端 JS bundle: $assetsDir"
+        Write-Host "  no Intl.DisplayNames bundle found; skipping language display names" -ForegroundColor DarkYellow
+        return
     }
 
-    $marker = "__claudeZhLabelPatch"
     $patch = ';(()=>{const e=Intl.DisplayNames&&Intl.DisplayNames.prototype;if(!e||e.__claudeZhLabelPatch)return;const n=e.of;e.of=function(e){const t=String(e);return t==="zh-CN"?"简体中文":t==="zh-HK"?"繁体中文（中国香港）":t==="zh-TW"?"繁体中文（中国台湾）":n.call(this,e)},Object.defineProperty(e,"__claudeZhLabelPatch",{value:!0})})();'
     $patchedFiles = 0
     foreach ($file in $jsFiles) {
