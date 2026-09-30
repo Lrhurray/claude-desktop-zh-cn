@@ -1391,17 +1391,10 @@ function Test-PlainUiTextReplacement {
 function Test-StructuralJsReplacement {
     param([string]$Source)
 
-    $structuralStrings = @(
-        "hour", "hours",
-        "minute", "minutes",
-        "second", "seconds",
-        "day", "days",
-        "week", "weeks",
-        "month", "months",
-        "year", "years"
-    )
+    # Lowercase single words (hours, tokens, matches...) are object keys or enum
+    # values in the bundled JS, not visible text; they are translated by the DOM layer only.
     $structuralLiterals = @('"Search"')
-    return ($structuralStrings -contains $Source) -or ($structuralLiterals -contains $Source)
+    return ($Source -cmatch '^[a-z][A-Za-z0-9_]*$') -or ($structuralLiterals -contains $Source)
 }
 
 function Test-StructuralJsLiteralContext {

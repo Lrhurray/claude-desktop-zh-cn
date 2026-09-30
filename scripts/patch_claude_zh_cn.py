@@ -47,22 +47,10 @@ ONLINE_LOCALE_MAIN_MARKER = "__claudeZhOnlineLocaleMain"
 ONLINE_LOCALE_LOCK_MARKER = "__claudeZhLocaleLock"
 MENU_RUNTIME_MARKER = "__claudeZhMenuRuntimePatch"
 ONLINE_TRANSLATION_MAX_SOURCE_LEN = 1000
-STRUCTURAL_JS_STRING_REPLACEMENTS = {
-    "hour",
-    "hours",
-    "minute",
-    "minutes",
-    "second",
-    "seconds",
-    "day",
-    "days",
-    "week",
-    "weeks",
-    "month",
-    "months",
-    "year",
-    "years",
-}
+# 纯小写单词（hours、tokens、matches……）在打包后的 JS 里几乎都是对象键、枚举值或
+# 状态值，而不是可见文案；静态替换会改坏程序逻辑（例如用量图表按 "tokens" 取指标，
+# 被改成 "令牌" 后读 undefined.daily 使会话页整页崩溃）。这类词条只走在线 DOM 翻译。
+STRUCTURAL_JS_IDENTIFIER_RE = re.compile(r"[a-z][A-Za-z0-9_]*")
 STRUCTURAL_JS_LITERAL_REPLACEMENTS = {
     '"Search"',
 }
@@ -244,7 +232,7 @@ def replace_frontend_hardcoded_text(
     target: str,
     pattern: re.Pattern[str] | None = None,
 ) -> tuple[str, int]:
-    if source in STRUCTURAL_JS_STRING_REPLACEMENTS or source in STRUCTURAL_JS_LITERAL_REPLACEMENTS:
+    if STRUCTURAL_JS_IDENTIFIER_RE.fullmatch(source) or source in STRUCTURAL_JS_LITERAL_REPLACEMENTS:
         return text, 0
 
     if not is_plain_ui_text_replacement(source):
