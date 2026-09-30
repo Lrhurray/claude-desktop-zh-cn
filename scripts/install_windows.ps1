@@ -1217,17 +1217,21 @@ function Get-FrontendJsFilesContaining {
         throw "未找到前端 JS bundle: $AssetsDir"
     }
 
-    $ascii = [System.Text.Encoding]::ASCII
     $patterns = @($Needles | Where-Object { $_ })
+    $keep = 0
+    foreach ($needle in $patterns) {
+        $keep = [Math]::Max($keep, $needle.Length - 1)
+    }
     $matched = New-Object System.Collections.Generic.List[System.IO.FileInfo]
     foreach ($file in $jsFiles) {
-        $stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        # StreamReader preserves UTF-8 characters split across reads. Keep enough
+        # overlap for the longest needle, rather than imposing a fixed limit.
+        $reader = [System.IO.StreamReader]::new($file.FullName, [System.Text.Encoding]::UTF8)
         try {
-            $buffer = [byte[]]::new(1024 * 1024)
+            $buffer = [char[]]::new(1024 * 1024)
             $carry = ""
-            $keep = 4096
-            while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                $chunk = $carry + $ascii.GetString($buffer, 0, $read)
+            while (($read = $reader.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $chunk = $carry + [string]::new($buffer, 0, $read)
                 foreach ($needle in $patterns) {
                     if ($chunk.Contains($needle)) {
                         $matched.Add($file)
@@ -1242,7 +1246,7 @@ function Get-FrontendJsFilesContaining {
             }
         }
         finally {
-            $stream.Dispose()
+            $reader.Dispose()
         }
     }
 
@@ -2307,24 +2311,12 @@ function Patch-HardcodedFrontendStrings {
     )
 
     $assetsDir = Join-Path $ResourcesPath "ion-dist\assets\v1"
-    $replacements = @(Get-FrontendHardcodedReplacements $Language)
-    $needles = New-Object System.Collections.Generic.List[string]
-    foreach ($pair in $replacements) {
-        $source = [string]$pair[0]
-        if ((Test-StructuralJsReplacement $source) -or $source.Contains("`n") -or $source.Length -lt 8) {
-            continue
-        }
-        $needle = ($source -replace '[^ -~]', '').Trim()
-        if ($needle.Length -ge 8) {
-            $needles.Add($needle.Substring(0, [Math]::Min(48, $needle.Length)))
-        }
-    }
-    $jsFiles = @(Get-FrontendJsFilesContaining $assetsDir @($needles | Select-Object -Unique))
+    $jsFiles = @(Get-ChildItem (Join-Path $assetsDir "*.js") -ErrorAction SilentlyContinue)
     if ($jsFiles.Count -eq 0) {
-        Write-Host "  no frontend JS contains hardcoded UI text; skipping" -ForegroundColor DarkYellow
-        return
+        throw "未找到前端 JS bundle: $assetsDir"
     }
 
+    $replacements = @(Get-FrontendHardcodedReplacements $Language)
 
     # 预处理：过滤结构性跳过规则，plain 规则一次性编译 Regex，
     # 避免 (文件 × 规则) 循环里反复拼 pattern、调函数、分配哈希表。
